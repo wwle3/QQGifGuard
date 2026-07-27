@@ -1,0 +1,52 @@
+# Build
+**/build/
+**/.gradle/
+**/captures/
+**/out/
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+
+# Local config
+local.properties
+*.iml
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Native / profiling
+*.so
+*.o
+*.obj
+*.log
+*.hprof
+*.trace
+
+# Python
+__pycache__/
+*.pyc
+
+# Local reverse-engineering payloads
+artifacts/
+decompiled/
+
+# Temporary
+tmp/
+temp/
+*.bak
+*.swp
+
+# Private research materials (do not commit)
+docs/handoff-research.md
+docs/jadx-notes-9.1.25.md
+docs/reverse-notes-9.1.25.md
+docs/gifinfohandle_jni_symbols.txt
+**/handoff*.md
+**/reverse-notes*.md
+**/jadx-notes*.md
+
+# Build output
+dist/
