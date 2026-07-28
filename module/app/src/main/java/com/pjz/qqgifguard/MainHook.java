@@ -56,6 +56,7 @@ public class MainHook implements IXposedHookLoadPackage {
             GifDrawableTracker.stopAll("app-non-interactive");
             // Soft L2 on background: recycle stale ones soon after.
             GifDrawableTracker.recycleStale("app-non-interactive", RECYCLE_AFTER_BG_MS);
+            GuardStats.forceSummary("app-non-interactive");
         });
 
         hookApplicationCreate(lpparam.classLoader);
@@ -83,6 +84,8 @@ public class MainHook implements IXposedHookLoadPackage {
                         GifDrawableTracker.stopOrphans("sweep-orphans");
                         GifDrawableTracker.recycleStale("sweep-stale-recycle", RECYCLE_AFTER_HIDDEN_MS);
                     }
+                    // Heartbeat summary so idle regressions are visible within ~30s.
+                    GuardStats.maybeSummary("maintenance", 30_000L);
                 } catch (Throwable t) {
                     XLog.w("maintenance sweep failed: " + t.getMessage());
                 } finally {
@@ -154,7 +157,8 @@ public class MainHook implements IXposedHookLoadPackage {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
                         if (!UiVisibility.isInteractive()) {
-                            XLog.i("block startDecoderThread (" + UiVisibility.stats() + ")");
+                            GuardStats.onStartBlocked();
+                            XLog.i("block startDecoderThread reason=app-non-interactive (" + UiVisibility.stats() + ")");
                             param.setResult(null);
                         }
                     }
@@ -189,18 +193,21 @@ public class MainHook implements IXposedHookLoadPackage {
 
                     if (GifDrawableTracker.isRecycled(d)) {
                         // Already destroyed; let original start fail soft or no-op via block.
-                        XLog.d("block GifDrawable.start (recycled)");
+                        GuardStats.onStartBlocked();
+                        XLog.d("block start reason=recycled");
                         param.setResult(null);
                         return;
                     }
                     if (!UiVisibility.isInteractive()) {
-                        XLog.i("block GifDrawable.start (" + UiVisibility.stats() + ")");
+                        GuardStats.onStartBlocked();
+                        XLog.i("block start reason=app-non-interactive (" + UiVisibility.stats() + ")");
                         param.setResult(null);
                         return;
                     }
                     if (!GifDrawableTracker.shouldKeepAnimating(d)) {
                         GifDrawableTracker.markHidden(d);
-                        XLog.d("block GifDrawable.start (not animatable/visible)");
+                        GuardStats.onStartBlocked();
+                        XLog.d("block start reason=not-animatable");
                         param.setResult(null);
                         return;
                     }
@@ -218,8 +225,13 @@ public class MainHook implements IXposedHookLoadPackage {
 
                         if (!visible) {
                             GifDrawableTracker.markHidden(d);
-                            safeStop(d);
-                            XLog.d("GifDrawable.setVisible(false) -> stop()");
+                            if (safeStop(d)) {
+                                GuardStats.onStopped(1);
+                                XLog.d("stop reason=setVisible visible=false");
+                            } else {
+                                XLog.d("markHidden reason=setVisible visible=false");
+                            }
+                            GuardStats.maybeSummary("setVisible", 10_000L);
                             return;
                         }
 
@@ -302,7 +314,9 @@ public class MainHook implements IXposedHookLoadPackage {
                         if (GifDrawableTracker.isRecycled(drawable)
                                 || !GifDrawableTracker.shouldKeepAnimating(drawable)) {
                             GifDrawableTracker.markHidden(drawable);
-                            safeStop(drawable);
+                            if (safeStop(drawable)) {
+                                GuardStats.onStopped(1);
+                            }
                             UiVisibility.onRenderBlocked();
                             param.setResult(null);
                             return;
@@ -317,11 +331,23 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private static void safeStop(Object d) {
+    private static boolean safeStop(Object d) {
         try {
-            XposedHelpers.callMethod(d, "stop");
+            boolean running = true;
+            try {
+                Object r = XposedHelpers.callMethod(d, "isRunning");
+                if (r instanceof Boolean) {
+                    running = (Boolean) r;
+                }
+            } catch (Throwable ignored) {
+            }
+            if (running) {
+                XposedHelpers.callMethod(d, "stop");
+                return true;
+            }
         } catch (Throwable ignored) {
         }
+        return false;
     }
 
     private static Field findDrawableField(Class<?> renderTaskCls) {

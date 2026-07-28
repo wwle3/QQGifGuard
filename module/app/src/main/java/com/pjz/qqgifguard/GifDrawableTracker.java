@@ -68,6 +68,7 @@ final class GifDrawableTracker {
         Entry existing = sMap.get(id);
         if (existing == null) {
             sMap.put(id, new Entry(drawable));
+            GuardStats.onTracked();
         }
         prune();
     }
@@ -135,9 +136,11 @@ final class GifDrawableTracker {
                 stopped++;
             }
         }
+        GuardStats.onStopped(stopped);
         if (stopped > 0 || seen > 0) {
             XLog.i("stopAll reason=" + reason + " stopped=" + stopped + " tracked=" + seen);
         }
+        GuardStats.maybeSummary(reason, 5_000L);
     }
 
     static void stopOrphans(String reason) {
@@ -162,8 +165,10 @@ final class GifDrawableTracker {
                 stopped++;
             }
         }
+        GuardStats.onStopped(stopped);
         if (stopped > 0) {
             XLog.i("stopOrphans reason=" + reason + " stopped=" + stopped + " tracked=" + seen);
+            GuardStats.maybeSummary(reason, 5_000L);
         }
     }
 
@@ -198,12 +203,14 @@ final class GifDrawableTracker {
                 recycled++;
             }
         }
+        GuardStats.onRecycled(recycled);
         if (recycled > 0 || candidates > 0) {
             XLog.i("recycleStale reason=" + reason
                     + " recycled=" + recycled
                     + " candidates=" + candidates
                     + " timeoutMs=" + timeoutMs
                     + " tracked=" + sMap.size());
+            GuardStats.maybeSummary(reason, 5_000L);
         }
     }
 

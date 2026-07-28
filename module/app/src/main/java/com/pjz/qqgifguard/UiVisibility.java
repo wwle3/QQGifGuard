@@ -123,6 +123,8 @@ final class UiVisibility {
                         XLog.w("nonInteractive listener failed: " + t.getMessage());
                     }
                 }
+            } else {
+                GuardStats.forceSummary("interactive-resume:" + reason);
             }
         }
         sLastEvalMs.set(System.currentTimeMillis());
@@ -175,18 +177,22 @@ final class UiVisibility {
     }
 
     static void onRenderAllowed() {
+        GuardStats.onRenderAllowed();
         long n = sAllowedRenderCount.incrementAndGet();
         if (n <= 5 || n % 200 == 0) {
-            XLog.d("render allowed #" + n);
+            XLog.d("render allowed #" + n + " reason=interactive");
         }
     }
 
     static void onRenderBlocked() {
+        GuardStats.onRenderBlocked();
         long n = sBlockedRenderCount.incrementAndGet();
         if (n <= 10 || n % 100 == 0) {
             XLog.i("render blocked #" + n
+                    + " reason=render-guard"
                     + " interactive=" + sInteractive.get()
                     + " startedActs=" + sStartedActivities);
+            GuardStats.maybeSummary("render-guard", 10_000L);
         }
     }
 
