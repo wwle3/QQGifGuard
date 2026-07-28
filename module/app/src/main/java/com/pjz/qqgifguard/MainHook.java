@@ -1,7 +1,6 @@
 package com.pjz.qqgifguard;
 
 import android.app.Application;
-import android.graphics.drawable.Drawable;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -18,12 +17,11 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  * Target: QQ 9.1.25 (8368), package com.tencent.mobileqq.
  *
- * L1+/L1.5 strategy:
- * - Suppress render/start while QQ is non-interactive.
- * - Always stop on setVisible(false).
- * - Resume on setVisible(true) only when interactive AND callback is attached.
- * - In RenderTask, skip render and stop when drawable is invisible/detached.
- * - Periodically sweep orphan running drawables (delayed CPU explosion fix).
+ * Strategy:
+ * L1  - stop/block animation when not needed
+ * L1.5- sweep orphan running drawables
+ * L2  - delayed recycle() for drawables that stay hidden/detached
+ *       (recoverable destruction: free native handle/bitmap after timeout)
  */
 public class MainHook implements IXposedHookLoadPackage {
     private static final String PKG = "com.tencent.mobileqq";
@@ -32,8 +30,13 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String CLS_RENDER_TASK = "com.tencent.libra.extension.gif.RenderTask";
 
     private static final AtomicBoolean sHooked = new AtomicBoolean(false);
-    private static final long ORPHAN_SWEEP_INTERVAL_MS = 2000L;
     private static final AtomicBoolean sSweepStarted = new AtomicBoolean(false);
+
+    private static final long ORPHAN_SWEEP_INTERVAL_MS = 2000L;
+    /** Hidden/detached long enough => recycle (L2). */
+    private static final long RECYCLE_AFTER_HIDDEN_MS = 8000L;
+    /** When app itself is non-interactive, recycle a bit more aggressively. */
+    private static final long RECYCLE_AFTER_BG_MS = 5000L;
 
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) {
@@ -51,17 +54,20 @@ public class MainHook implements IXposedHookLoadPackage {
         UiVisibility.install(lpparam.classLoader);
         UiVisibility.setNonInteractiveListener(() -> {
             GifDrawableTracker.stopAll("app-non-interactive");
+            // Soft L2 on background: recycle stale ones soon after.
+            GifDrawableTracker.recycleStale("app-non-interactive", RECYCLE_AFTER_BG_MS);
         });
+
         hookApplicationCreate(lpparam.classLoader);
         hookGifInfoHandle(lpparam.classLoader);
         hookGifDrawable(lpparam.classLoader);
         hookRenderTask(lpparam.classLoader);
-        startOrphanSweeper();
+        startMaintenanceSweeper();
 
-        XLog.i("hooks installed");
+        XLog.i("hooks installed (L1+L2 delayed-recycle)");
     }
 
-    private void startOrphanSweeper() {
+    private void startMaintenanceSweeper() {
         if (!sSweepStarted.compareAndSet(false, true)) {
             return;
         }
@@ -72,18 +78,22 @@ public class MainHook implements IXposedHookLoadPackage {
                 try {
                     if (!UiVisibility.isInteractive()) {
                         GifDrawableTracker.stopAll("sweep-non-interactive");
+                        GifDrawableTracker.recycleStale("sweep-bg-recycle", RECYCLE_AFTER_BG_MS);
                     } else {
                         GifDrawableTracker.stopOrphans("sweep-orphans");
+                        GifDrawableTracker.recycleStale("sweep-stale-recycle", RECYCLE_AFTER_HIDDEN_MS);
                     }
                 } catch (Throwable t) {
-                    XLog.w("orphan sweep failed: " + t.getMessage());
+                    XLog.w("maintenance sweep failed: " + t.getMessage());
                 } finally {
                     h.postDelayed(this, ORPHAN_SWEEP_INTERVAL_MS);
                 }
             }
         };
         h.postDelayed(sweep, ORPHAN_SWEEP_INTERVAL_MS);
-        XLog.i("orphan sweeper started intervalMs=" + ORPHAN_SWEEP_INTERVAL_MS);
+        XLog.i("maintenance sweeper started intervalMs=" + ORPHAN_SWEEP_INTERVAL_MS
+                + " recycleAfterHiddenMs=" + RECYCLE_AFTER_HIDDEN_MS
+                + " recycleAfterBgMs=" + RECYCLE_AFTER_BG_MS);
     }
 
     private void hookApplicationCreate(final ClassLoader cl) {
@@ -174,17 +184,27 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedBridge.hookAllMethods(cls, "start", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    GifDrawableTracker.track(param.thisObject);
+                    Object d = param.thisObject;
+                    GifDrawableTracker.track(d);
+
+                    if (GifDrawableTracker.isRecycled(d)) {
+                        // Already destroyed; let original start fail soft or no-op via block.
+                        XLog.d("block GifDrawable.start (recycled)");
+                        param.setResult(null);
+                        return;
+                    }
                     if (!UiVisibility.isInteractive()) {
                         XLog.i("block GifDrawable.start (" + UiVisibility.stats() + ")");
                         param.setResult(null);
                         return;
                     }
-                    // Refuse to start detached/invisible drawables.
-                    if (!shouldAnimate(param.thisObject)) {
+                    if (!GifDrawableTracker.shouldKeepAnimating(d)) {
+                        GifDrawableTracker.markHidden(d);
                         XLog.d("block GifDrawable.start (not animatable/visible)");
                         param.setResult(null);
+                        return;
                     }
+                    GifDrawableTracker.markVisible(d);
                 }
             });
 
@@ -192,34 +212,59 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     try {
-                        GifDrawableTracker.track(param.thisObject);
+                        Object d = param.thisObject;
+                        GifDrawableTracker.track(d);
                         boolean visible = (Boolean) param.args[0];
+
                         if (!visible) {
-                            XposedHelpers.callMethod(param.thisObject, "stop");
+                            GifDrawableTracker.markHidden(d);
+                            safeStop(d);
                             XLog.d("GifDrawable.setVisible(false) -> stop()");
                             return;
                         }
 
-                        if (!UiVisibility.isInteractive() || !shouldAnimate(param.thisObject)) {
-                            XposedHelpers.callMethod(param.thisObject, "stop");
+                        // Visible again: cancel pending recycle timer.
+                        GifDrawableTracker.markVisible(d);
+
+                        if (!UiVisibility.isInteractive()
+                                || !GifDrawableTracker.shouldKeepAnimating(d)
+                                || GifDrawableTracker.isRecycled(d)) {
+                            safeStop(d);
                             return;
                         }
 
                         boolean running = false;
                         try {
-                            Object r = XposedHelpers.callMethod(param.thisObject, "isRunning");
+                            Object r = XposedHelpers.callMethod(d, "isRunning");
                             running = r instanceof Boolean && (Boolean) r;
                         } catch (Throwable ignored) {
                         }
                         if (!running) {
-                            XposedHelpers.callMethod(param.thisObject, "start");
-                            XLog.d("GifDrawable.setVisible(true) -> start()");
+                            // If we recycled earlier, start() may no-op/fail; QQ usually recreates drawable.
+                            try {
+                                XposedHelpers.callMethod(d, "start");
+                                XLog.d("GifDrawable.setVisible(true) -> start()");
+                            } catch (Throwable t) {
+                                XLog.w("resume start failed (maybe recycled): " + t.getMessage());
+                            }
                         }
                     } catch (Throwable t) {
                         XLog.w("setVisible after failed: " + t.getMessage());
                     }
                 }
             });
+
+            // Observe recycle to mark state.
+            try {
+                XposedBridge.hookAllMethods(cls, "recycle", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        GifDrawableTracker.markHidden(param.thisObject);
+                        XLog.d("GifDrawable.recycle() observed");
+                    }
+                });
+            } catch (Throwable ignored) {
+            }
 
             XLog.i("hook GifDrawable.start/setVisible OK");
             dumpMethods(cls, "GifDrawable");
@@ -247,7 +292,6 @@ public class MainHook implements IXposedHookLoadPackage {
                         if (drawableField != null) {
                             drawable = drawableField.get(param.thisObject);
                         } else {
-                            // SafeRunnable stores GifDrawable in field "e"
                             drawable = XposedHelpers.getObjectField(param.thisObject, "e");
                         }
                     } catch (Throwable ignored) {
@@ -255,14 +299,15 @@ public class MainHook implements IXposedHookLoadPackage {
 
                     if (drawable != null) {
                         GifDrawableTracker.track(drawable);
-                        if (!shouldAnimate(drawable)) {
-                            try {
-                                XposedHelpers.callMethod(drawable, "stop");
-                            } catch (Throwable ignored) {
-                            }
+                        if (GifDrawableTracker.isRecycled(drawable)
+                                || !GifDrawableTracker.shouldKeepAnimating(drawable)) {
+                            GifDrawableTracker.markHidden(drawable);
+                            safeStop(drawable);
                             UiVisibility.onRenderBlocked();
                             param.setResult(null);
+                            return;
                         }
+                        GifDrawableTracker.markVisible(drawable);
                     }
                 }
             });
@@ -272,34 +317,15 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * A drawable should animate only when it still has a view callback and reports visible.
-     */
-    private static boolean shouldAnimate(Object drawable) {
-        if (drawable == null) {
-            return false;
-        }
+    private static void safeStop(Object d) {
         try {
-            Object visibleObj = XposedHelpers.callMethod(drawable, "isVisible");
-            if (visibleObj instanceof Boolean && !(Boolean) visibleObj) {
-                return false;
-            }
+            XposedHelpers.callMethod(d, "stop");
         } catch (Throwable ignored) {
         }
-        try {
-            Object cb = XposedHelpers.callMethod(drawable, "getCallback");
-            if (cb == null) {
-                return false;
-            }
-        } catch (Throwable ignored) {
-            // If getCallback is unavailable, fall back to visible-only checks.
-        }
-        return true;
     }
 
     private static Field findDrawableField(Class<?> renderTaskCls) {
         try {
-            // SafeRunnable declares final GifDrawable e
             Class<?> c = renderTaskCls;
             while (c != null && c != Object.class) {
                 try {
