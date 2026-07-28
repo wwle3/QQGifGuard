@@ -1,9 +1,9 @@
 # Verification checklist
 
-Baseline: module `0.2.0` behavior with L1 stop + L1.5 orphan sweep + L2 delayed recycle.
+Baseline: module `0.2.1` behavior with L1 stop + L1.5 orphan sweep + L2 delayed recycle.
 Always cold-start QQ after installing or updating the module before judging results.
 
-## Functional (0.2.0 regression)
+## Functional (0.2.1 regression)
 
 - [ ] Foreground chat GIF animates normally
 - [ ] Fast scroll up/down and return within about 8s still resumes playback
