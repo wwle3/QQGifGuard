@@ -24,6 +24,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * This check is independent of OEM cgroup freeze behavior.
  */
 final class UiVisibility {
+    interface NonInteractiveListener {
+        void onNonInteractive();
+    }
+
     private static final AtomicBoolean sInteractive = new AtomicBoolean(true);
     private static final AtomicLong sLastEvalMs = new AtomicLong(0);
     private static final AtomicLong sBlockedRenderCount = new AtomicLong(0);
@@ -33,6 +37,7 @@ final class UiVisibility {
     private static volatile int sStartedActivities = 0;
     private static volatile boolean sInstalled = false;
     private static volatile boolean sLifecycleInstalled = false;
+    private static volatile NonInteractiveListener sNonInteractiveListener;
     private static final Handler sMain = new Handler(Looper.getMainLooper());
 
     private UiVisibility() {
@@ -44,6 +49,10 @@ final class UiVisibility {
         }
         sInstalled = true;
         XLog.i("UiVisibility bootstrap");
+    }
+
+    static void setNonInteractiveListener(NonInteractiveListener listener) {
+        sNonInteractiveListener = listener;
     }
 
     static void onApplicationCreate(Application app) {
@@ -105,6 +114,16 @@ final class UiVisibility {
         boolean prev = sInteractive.getAndSet(value);
         if (prev != value) {
             XLog.i("interactive " + prev + " -> " + value + " (" + reason + ")");
+            if (!value) {
+                NonInteractiveListener l = sNonInteractiveListener;
+                if (l != null) {
+                    try {
+                        l.onNonInteractive();
+                    } catch (Throwable t) {
+                        XLog.w("nonInteractive listener failed: " + t.getMessage());
+                    }
+                }
+            }
         }
         sLastEvalMs.set(System.currentTimeMillis());
     }

@@ -26,10 +26,10 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * keep running and burn CPU.
  *
  * L1 strategy:
- * - If QQ is not interactively visible, suppress render/start paths.
- * - Force-stop drawables only when the app itself is non-interactive.
- * - When a drawable becomes visible again while interactive, ensure start() is called
- *   so in-chat scroll recycle can resume animation.
+ * - Suppress render/start while QQ is non-interactive.
+ * - Always stop() when a drawable becomes invisible (covers off-screen chat items).
+ * - start() again when it becomes visible and QQ is interactive (covers scroll resume).
+ * - When QQ itself becomes non-interactive, stop all tracked drawables.
  */
 public class MainHook implements IXposedHookLoadPackage {
     private static final String PKG = "com.tencent.mobileqq";
@@ -54,6 +54,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 + " sdk=" + android.os.Build.VERSION.SDK_INT);
 
         UiVisibility.install(lpparam.classLoader);
+        UiVisibility.setNonInteractiveListener(() -> GifDrawableTracker.stopAll("app-non-interactive"));
         hookApplicationCreate(lpparam.classLoader);
         hookGifInfoHandle(lpparam.classLoader);
         hookGifDrawable(lpparam.classLoader);
@@ -143,9 +144,18 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             Class<?> cls = XposedHelpers.findClass(CLS_GIF_DRAWABLE, cl);
 
+            // Track constructions so background transition can stop leftovers.
+            XposedBridge.hookAllConstructors(cls, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    GifDrawableTracker.track(param.thisObject);
+                }
+            });
+
             XposedBridge.hookAllMethods(cls, "start", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
+                    GifDrawableTracker.track(param.thisObject);
                     if (!UiVisibility.isInteractive()) {
                         XLog.i("block GifDrawable.start (" + UiVisibility.stats() + ")");
                         param.setResult(null);
@@ -153,26 +163,24 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             });
 
-            // Important:
-            // Do NOT unconditionally stop() on every setVisible(false).
-            // In-chat scrolling detaches items and flips visibility; forcing stop there
-            // can leave GIFs frozen until the chat page is re-entered.
-            // Only force-stop when the app itself is non-interactive (background/freeform).
-            // When becoming visible again while interactive, ensure start() resumes.
+            // Visibility policy:
+            // - false: always stop. This stops off-screen chat items and prevents pool spin.
+            // - true + interactive: ensure start, so scroll-back resumes animation.
             XposedBridge.hookAllMethods(cls, "setVisible", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     try {
+                        GifDrawableTracker.track(param.thisObject);
                         boolean visible = (Boolean) param.args[0];
                         if (!visible) {
-                            if (!UiVisibility.isInteractive()) {
-                                XposedHelpers.callMethod(param.thisObject, "stop");
-                                XLog.d("GifDrawable.setVisible(false) -> stop() [non-interactive]");
-                            }
+                            XposedHelpers.callMethod(param.thisObject, "stop");
+                            XLog.d("GifDrawable.setVisible(false) -> stop()");
                             return;
                         }
 
                         if (!UiVisibility.isInteractive()) {
+                            // Becoming visible while app is background should not animate.
+                            XposedHelpers.callMethod(param.thisObject, "stop");
                             return;
                         }
 
