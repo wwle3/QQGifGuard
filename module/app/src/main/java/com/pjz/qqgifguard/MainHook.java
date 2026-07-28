@@ -20,8 +20,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * Strategy:
  * L1  - stop/block animation when not needed
  * L1.5- sweep orphan running drawables
- * L2  - delayed recycle() for drawables that stay hidden/detached
- *       (recoverable destruction: free native handle/bitmap after timeout)
+ * L2  - delayed recycle() only for detached orphan drawables
+ *       (attached-but-stopped GIFs are kept so returning to chat can resume)
  */
 public class MainHook implements IXposedHookLoadPackage {
     private static final String PKG = "com.tencent.mobileqq";
@@ -33,9 +33,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final AtomicBoolean sSweepStarted = new AtomicBoolean(false);
 
     private static final long ORPHAN_SWEEP_INTERVAL_MS = 2000L;
-    /** Hidden/detached long enough => recycle (L2). */
+    /** Detached orphan long enough => recycle (L2). Attached ones are never recycled. */
     private static final long RECYCLE_AFTER_HIDDEN_MS = 8000L;
-    /** When app itself is non-interactive, recycle a bit more aggressively. */
+    /** When app itself is non-interactive, recycle detached orphans a bit sooner. */
     private static final long RECYCLE_AFTER_BG_MS = 5000L;
 
     @Override
@@ -54,9 +54,13 @@ public class MainHook implements IXposedHookLoadPackage {
         UiVisibility.install(lpparam.classLoader);
         UiVisibility.setNonInteractiveListener(() -> {
             GifDrawableTracker.stopAll("app-non-interactive");
-            // Soft L2 on background: recycle stale ones soon after.
+            // Soft L2 on background: recycle detached orphans only.
             GifDrawableTracker.recycleStale("app-non-interactive", RECYCLE_AFTER_BG_MS);
             GuardStats.forceSummary("app-non-interactive");
+        });
+        UiVisibility.setInteractiveListener(() -> {
+            // Returning to QQ: restart still-attached GIFs that we only stopped.
+            GifDrawableTracker.resumeAttached("app-interactive");
         });
 
         hookApplicationCreate(lpparam.classLoader);
@@ -65,7 +69,7 @@ public class MainHook implements IXposedHookLoadPackage {
         hookRenderTask(lpparam.classLoader);
         startMaintenanceSweeper();
 
-        XLog.i("hooks installed (L1+L2 delayed-recycle)");
+        XLog.i("hooks installed (L1+L2 detached-only recycle)");
     }
 
     private void startMaintenanceSweeper() {

@@ -28,6 +28,10 @@ final class UiVisibility {
         void onNonInteractive();
     }
 
+    interface InteractiveListener {
+        void onInteractive();
+    }
+
     private static final AtomicBoolean sInteractive = new AtomicBoolean(true);
     private static final AtomicLong sLastEvalMs = new AtomicLong(0);
     private static final AtomicLong sBlockedRenderCount = new AtomicLong(0);
@@ -38,6 +42,7 @@ final class UiVisibility {
     private static volatile boolean sInstalled = false;
     private static volatile boolean sLifecycleInstalled = false;
     private static volatile NonInteractiveListener sNonInteractiveListener;
+    private static volatile InteractiveListener sInteractiveListener;
     private static final Handler sMain = new Handler(Looper.getMainLooper());
 
     private UiVisibility() {
@@ -53,6 +58,10 @@ final class UiVisibility {
 
     static void setNonInteractiveListener(NonInteractiveListener listener) {
         sNonInteractiveListener = listener;
+    }
+
+    static void setInteractiveListener(InteractiveListener listener) {
+        sInteractiveListener = listener;
     }
 
     static void onApplicationCreate(Application app) {
@@ -124,6 +133,14 @@ final class UiVisibility {
                     }
                 }
             } else {
+                InteractiveListener l = sInteractiveListener;
+                if (l != null) {
+                    try {
+                        l.onInteractive();
+                    } catch (Throwable t) {
+                        XLog.w("interactive listener failed: " + t.getMessage());
+                    }
+                }
                 GuardStats.forceSummary("interactive-resume:" + reason);
             }
         }

@@ -12,7 +12,8 @@ import de.robv.android.xposed.XposedHelpers;
  *
  * Policy:
  * - stop immediately when hidden/detached/non-interactive
- * - recycle only after staying unusable for a timeout (recoverable L2)
+ * - recycle only true orphans (no UI callback / detached) after timeout
+ * - still-attached drawables are stopped but kept so returning to chat can resume
  * - if it becomes visible again before timeout, cancel recycle and allow restart
  */
 final class GifDrawableTracker {
@@ -173,13 +174,15 @@ final class GifDrawableTracker {
     }
 
     /**
-     * Recycle drawables that remained hidden/detached longer than timeoutMs.
-     * This is the limited L2 path: destroy only stale ones.
+     * Recycle only orphan drawables that stayed detached longer than timeoutMs.
+     * Still-attached-but-hidden GIFs are intentionally NOT recycled: destroying
+     * them leaves blank ImageViews until QQ rebinds (re-enter chat / scroll).
      */
     static void recycleStale(String reason, long timeoutMs) {
         prune();
         int recycled = 0;
         int candidates = 0;
+        int attachedSkipped = 0;
         long now = System.currentTimeMillis();
         for (Entry e : sMap.values()) {
             Object d = e.ref.get();
@@ -188,6 +191,14 @@ final class GifDrawableTracker {
             }
             if (shouldKeepAnimating(d)) {
                 e.hiddenSinceMs = 0L;
+                continue;
+            }
+            // Attached to a View/callback: stop is enough; keep native handle for resume.
+            if (isAttachedToUi(d)) {
+                attachedSkipped++;
+                if (e.hiddenSinceMs == 0L) {
+                    e.hiddenSinceMs = now;
+                }
                 continue;
             }
             if (e.hiddenSinceMs == 0L) {
@@ -204,12 +215,45 @@ final class GifDrawableTracker {
             }
         }
         GuardStats.onRecycled(recycled);
-        if (recycled > 0 || candidates > 0) {
+        if (recycled > 0 || candidates > 0 || attachedSkipped > 0) {
             XLog.i("recycleStale reason=" + reason
                     + " recycled=" + recycled
                     + " candidates=" + candidates
+                    + " attachedSkipped=" + attachedSkipped
                     + " timeoutMs=" + timeoutMs
                     + " tracked=" + sMap.size());
+            GuardStats.maybeSummary(reason, 5_000L);
+        }
+    }
+
+    /**
+     * After app becomes interactive again, restart stopped-but-still-owned GIFs
+     * that are visible enough to animate. Does not touch recycled orphans.
+     */
+    static void resumeAttached(String reason) {
+        prune();
+        int started = 0;
+        int seen = 0;
+        for (Entry e : sMap.values()) {
+            Object d = e.ref.get();
+            if (d == null || e.recycledByUs || isRecycled(d)) {
+                continue;
+            }
+            seen++;
+            // Only resume drawables still owned by an on-screen-ish view.
+            if (!isAttachedToUi(d) || !isCallbackViewLikelyVisible(d)) {
+                continue;
+            }
+            e.hiddenSinceMs = 0L;
+            ensureDrawableVisible(d);
+            if (startDrawable(d)) {
+                started++;
+            }
+        }
+        if (started > 0 || seen > 0) {
+            XLog.i("resumeAttached reason=" + reason
+                    + " started=" + started
+                    + " tracked=" + seen);
             GuardStats.maybeSummary(reason, 5_000L);
         }
     }
@@ -239,6 +283,75 @@ final class GifDrawableTracker {
         return false;
     }
 
+    /**
+     * True when some UI still owns this drawable.
+     * Prefer not recycling in that case so returning to the same chat can resume.
+     */
+    static boolean isAttachedToUi(Object drawable) {
+        if (drawable == null || isRecycled(drawable)) {
+            return false;
+        }
+        Object cb = getCallback(drawable);
+        if (cb == null) {
+            return false;
+        }
+        if (cb instanceof android.view.View) {
+            try {
+                return ((android.view.View) cb).isAttachedToWindow();
+            } catch (Throwable ignored) {
+                // Fail closed toward "attached" so we do not recycle aggressively.
+                return true;
+            }
+        }
+        // Unknown callback owner: treat as attached (safe default against blank images).
+        return true;
+    }
+
+    private static Object getCallback(Object drawable) {
+        try {
+            return XposedHelpers.callMethod(drawable, "getCallback");
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean isCallbackViewLikelyVisible(Object drawable) {
+        Object cb = getCallback(drawable);
+        if (!(cb instanceof android.view.View)) {
+            // Non-view callback: allow resume attempt if attached.
+            return cb != null;
+        }
+        android.view.View v = (android.view.View) cb;
+        try {
+            if (!v.isAttachedToWindow()) {
+                return false;
+            }
+            if (v.getVisibility() != android.view.View.VISIBLE) {
+                return false;
+            }
+            // getGlobalVisibleRect is a practical "on screen" hint without requiring full draw.
+            android.graphics.Rect r = new android.graphics.Rect();
+            return v.getGlobalVisibleRect(r);
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    private static void ensureDrawableVisible(Object drawable) {
+        try {
+            Object visibleObj = XposedHelpers.callMethod(drawable, "isVisible");
+            if (visibleObj instanceof Boolean && (Boolean) visibleObj) {
+                return;
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            // Best-effort: mirror View visibility so GifDrawable can animate again.
+            XposedHelpers.callMethod(drawable, "setVisible", true, false);
+        } catch (Throwable ignored) {
+        }
+    }
+
     static boolean shouldKeepAnimating(Object drawable) {
         if (drawable == null || isRecycled(drawable)) {
             return false;
@@ -250,14 +363,7 @@ final class GifDrawableTracker {
             }
         } catch (Throwable ignored) {
         }
-        try {
-            Object cb = XposedHelpers.callMethod(drawable, "getCallback");
-            if (cb == null) {
-                return false;
-            }
-        } catch (Throwable ignored) {
-        }
-        return true;
+        return isAttachedToUi(drawable);
     }
 
     private static boolean stopDrawable(Object d) {
@@ -276,6 +382,26 @@ final class GifDrawableTracker {
             }
         } catch (Throwable t) {
             XLog.w("stopDrawable failed: " + t.getMessage());
+        }
+        return false;
+    }
+
+    private static boolean startDrawable(Object d) {
+        try {
+            boolean running = false;
+            try {
+                Object r = XposedHelpers.callMethod(d, "isRunning");
+                if (r instanceof Boolean) {
+                    running = (Boolean) r;
+                }
+            } catch (Throwable ignored) {
+            }
+            if (!running) {
+                XposedHelpers.callMethod(d, "start");
+                return true;
+            }
+        } catch (Throwable t) {
+            XLog.w("startDrawable failed: " + t.getMessage());
         }
         return false;
     }
