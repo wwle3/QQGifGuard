@@ -16,17 +16,15 @@ RenderTask.e()
 
 OEM freezers may hide the symptom by freezing the whole UID. Once unfrozen, the same process often resumes GIF spin without returning to the foreground.
 
-## Solution (L1)
+## Solution
 
-When QQ is not interactively visible:
+Layered control for QQ Libra GIFs:
 
-1. Suppress `RenderTask.e`
-2. Suppress `GifInfoHandle.x` / `renderFrame` (return `0L`)
-3. Suppress `GifInfoHandle.startDecoderThread`
-4. Suppress `GifDrawable.start`
-5. On `GifDrawable.setVisible(false)`, force `stop()`
+1. **L1** – when QQ is not interactively visible, suppress `RenderTask.e`, `GifInfoHandle.x` / `renderFrame`, decoder start, and `GifDrawable.start`; on `setVisible(false)` force `stop()`
+2. **L1.5** – periodically stop orphan invisible/detached running drawables
+3. **L2 (limited)** – if a drawable stays hidden/detached beyond a timeout, call `recycle()` to free native handle/bitmap (recoverable destruction, not instant free-on-hide)
 
-When QQ is foreground/visible, rendering is allowed.
+Foreground visible GIFs still play. Quick scroll-back cancels the recycle timer.
 
 ## Project layout
 
@@ -101,15 +99,26 @@ In LSPosed Manager:
 ## Verify
 
 ```bash
-adb logcat -s QQGifGuard:D LSPosed-Bridge:I
+# Correct: filter by message prefix
+adb logcat -v time | grep --line-buffered QQGifGuard
+
+# On device / SSH
+logcat -v time | grep --line-buffered QQGifGuard
+# or
+grep QQGifGuard /data/adb/lspd/log/modules_*.log | tail
 ```
+
+Do **not** use `logcat -s QQGifGuard` — the Android tag is typically `LSPosedFramework`, while the stable message prefix is `QQGifGuard:`.
 
 Expected:
 
 - Module loads in `com.tencent.mobileqq`
 - Foreground chat GIFs still play (`render allowed`)
-- Leaving chat / freeform triggers `setVisible(false) -> stop()` and/or `render blocked`
-- After UID unfreeze, no sustained `pool-38` / `libgiflibra` CPU spin
+- Leaving chat / freeform triggers stop / recycle / `render blocked` with explicit reasons
+- Periodic `stats reason=...` lines show tracked / stopped / recycled / blocked counters
+- After idle or UID unfreeze, no sustained `pool-*` / `libgiflibra` CPU spin
+
+See `docs/verification.md` for the full 0.1.4 regression checklist and observation commands.
 
 ## Version lock
 
@@ -125,7 +134,8 @@ Validated against:
 
 ## Limitations
 
-- L1 is a safety net, not full resource reclamation
-- L2 should recycle/free on item detach / page destroy
+- L1/L1.5 stop animation work; L2 only delayed-recycles stale drawables (not instant free-on-hide)
+- Timeout-based recycle is a complement to, not a full replacement for, real detach/unbind hooks
 - Sticker panel / preview false positives need policy tuning if observed
+- Installing over a already-leaking QQ process does not self-heal it; cold start is required
 - Hooking QQ has residual detection surface; use at your own risk
