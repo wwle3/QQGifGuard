@@ -1,7 +1,9 @@
 package com.pjz.qqgifguard;
 
 import android.app.Application;
+import android.graphics.drawable.Drawable;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -16,20 +18,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *
  * Target: QQ 9.1.25 (8368), package com.tencent.mobileqq.
  *
- * Observed animation path:
- *   RenderTask.e()
- *     -> GifInfoHandle.x(Bitmap)
- *        -> native renderFrame(long, Bitmap) in libgiflibra.so
- *
- * GifDrawable.stop() only calls saveRemainder; it does not free the native handle.
- * When the chat leaves the foreground or freeform window, scheduled render work may
- * keep running and burn CPU.
- *
- * L1 strategy:
+ * L1+/L1.5 strategy:
  * - Suppress render/start while QQ is non-interactive.
- * - Always stop() when a drawable becomes invisible (covers off-screen chat items).
- * - start() again when it becomes visible and QQ is interactive (covers scroll resume).
- * - When QQ itself becomes non-interactive, stop all tracked drawables.
+ * - Always stop on setVisible(false).
+ * - Resume on setVisible(true) only when interactive AND callback is attached.
+ * - In RenderTask, skip render and stop when drawable is invisible/detached.
+ * - Periodically sweep orphan running drawables (delayed CPU explosion fix).
  */
 public class MainHook implements IXposedHookLoadPackage {
     private static final String PKG = "com.tencent.mobileqq";
@@ -38,13 +32,14 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String CLS_RENDER_TASK = "com.tencent.libra.extension.gif.RenderTask";
 
     private static final AtomicBoolean sHooked = new AtomicBoolean(false);
+    private static final long ORPHAN_SWEEP_INTERVAL_MS = 2000L;
+    private static final AtomicBoolean sSweepStarted = new AtomicBoolean(false);
 
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) {
         if (!PKG.equals(lpparam.packageName)) {
             return;
         }
-        // Install once per process.
         if (!sHooked.compareAndSet(false, true)) {
             return;
         }
@@ -54,13 +49,41 @@ public class MainHook implements IXposedHookLoadPackage {
                 + " sdk=" + android.os.Build.VERSION.SDK_INT);
 
         UiVisibility.install(lpparam.classLoader);
-        UiVisibility.setNonInteractiveListener(() -> GifDrawableTracker.stopAll("app-non-interactive"));
+        UiVisibility.setNonInteractiveListener(() -> {
+            GifDrawableTracker.stopAll("app-non-interactive");
+        });
         hookApplicationCreate(lpparam.classLoader);
         hookGifInfoHandle(lpparam.classLoader);
         hookGifDrawable(lpparam.classLoader);
         hookRenderTask(lpparam.classLoader);
+        startOrphanSweeper();
 
         XLog.i("hooks installed");
+    }
+
+    private void startOrphanSweeper() {
+        if (!sSweepStarted.compareAndSet(false, true)) {
+            return;
+        }
+        final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+        final Runnable sweep = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (!UiVisibility.isInteractive()) {
+                        GifDrawableTracker.stopAll("sweep-non-interactive");
+                    } else {
+                        GifDrawableTracker.stopOrphans("sweep-orphans");
+                    }
+                } catch (Throwable t) {
+                    XLog.w("orphan sweep failed: " + t.getMessage());
+                } finally {
+                    h.postDelayed(this, ORPHAN_SWEEP_INTERVAL_MS);
+                }
+            }
+        };
+        h.postDelayed(sweep, ORPHAN_SWEEP_INTERVAL_MS);
+        XLog.i("orphan sweeper started intervalMs=" + ORPHAN_SWEEP_INTERVAL_MS);
     }
 
     private void hookApplicationCreate(final ClassLoader cl) {
@@ -88,13 +111,11 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             Class<?> cls = XposedHelpers.findClass(CLS_GIF_INFO, cl);
 
-            // synchronized long x(Bitmap) -> native renderFrame
             XposedBridge.hookAllMethods(cls, "x", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (!UiVisibility.isInteractive()) {
                         UiVisibility.onRenderBlocked();
-                        // Frame delay sentinel: 0 prevents further scheduling.
                         param.setResult(0L);
                     } else {
                         UiVisibility.onRenderAllowed();
@@ -103,7 +124,6 @@ public class MainHook implements IXposedHookLoadPackage {
             });
             XLog.i("hook GifInfoHandle.x OK");
 
-            // Private native fallback.
             try {
                 XposedBridge.hookAllMethods(cls, "renderFrame", new XC_MethodHook() {
                     @Override
@@ -144,7 +164,6 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             Class<?> cls = XposedHelpers.findClass(CLS_GIF_DRAWABLE, cl);
 
-            // Track constructions so background transition can stop leftovers.
             XposedBridge.hookAllConstructors(cls, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
@@ -159,13 +178,16 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (!UiVisibility.isInteractive()) {
                         XLog.i("block GifDrawable.start (" + UiVisibility.stats() + ")");
                         param.setResult(null);
+                        return;
+                    }
+                    // Refuse to start detached/invisible drawables.
+                    if (!shouldAnimate(param.thisObject)) {
+                        XLog.d("block GifDrawable.start (not animatable/visible)");
+                        param.setResult(null);
                     }
                 }
             });
 
-            // Visibility policy:
-            // - false: always stop. This stops off-screen chat items and prevents pool spin.
-            // - true + interactive: ensure start, so scroll-back resumes animation.
             XposedBridge.hookAllMethods(cls, "setVisible", new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
@@ -178,8 +200,7 @@ public class MainHook implements IXposedHookLoadPackage {
                             return;
                         }
 
-                        if (!UiVisibility.isInteractive()) {
-                            // Becoming visible while app is background should not animate.
+                        if (!UiVisibility.isInteractive() || !shouldAnimate(param.thisObject)) {
                             XposedHelpers.callMethod(param.thisObject, "stop");
                             return;
                         }
@@ -189,7 +210,6 @@ public class MainHook implements IXposedHookLoadPackage {
                             Object r = XposedHelpers.callMethod(param.thisObject, "isRunning");
                             running = r instanceof Boolean && (Boolean) r;
                         } catch (Throwable ignored) {
-                            // Some builds may not expose isRunning cleanly; still try start.
                         }
                         if (!running) {
                             XposedHelpers.callMethod(param.thisObject, "start");
@@ -211,13 +231,38 @@ public class MainHook implements IXposedHookLoadPackage {
     private void hookRenderTask(final ClassLoader cl) {
         try {
             Class<?> cls = XposedHelpers.findClass(CLS_RENDER_TASK, cl);
-            // RenderTask.e() performs renderFrame and reschedules itself.
+            final Field drawableField = findDrawableField(cls);
+
             XposedBridge.hookAllMethods(cls, "e", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
                     if (!UiVisibility.isInteractive()) {
                         UiVisibility.onRenderBlocked();
                         param.setResult(null);
+                        return;
+                    }
+
+                    Object drawable = null;
+                    try {
+                        if (drawableField != null) {
+                            drawable = drawableField.get(param.thisObject);
+                        } else {
+                            // SafeRunnable stores GifDrawable in field "e"
+                            drawable = XposedHelpers.getObjectField(param.thisObject, "e");
+                        }
+                    } catch (Throwable ignored) {
+                    }
+
+                    if (drawable != null) {
+                        GifDrawableTracker.track(drawable);
+                        if (!shouldAnimate(drawable)) {
+                            try {
+                                XposedHelpers.callMethod(drawable, "stop");
+                            } catch (Throwable ignored) {
+                            }
+                            UiVisibility.onRenderBlocked();
+                            param.setResult(null);
+                        }
                     }
                 }
             });
@@ -225,6 +270,49 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XLog.w("hook RenderTask.e skipped: " + t.getMessage());
         }
+    }
+
+    /**
+     * A drawable should animate only when it still has a view callback and reports visible.
+     */
+    private static boolean shouldAnimate(Object drawable) {
+        if (drawable == null) {
+            return false;
+        }
+        try {
+            Object visibleObj = XposedHelpers.callMethod(drawable, "isVisible");
+            if (visibleObj instanceof Boolean && !(Boolean) visibleObj) {
+                return false;
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Object cb = XposedHelpers.callMethod(drawable, "getCallback");
+            if (cb == null) {
+                return false;
+            }
+        } catch (Throwable ignored) {
+            // If getCallback is unavailable, fall back to visible-only checks.
+        }
+        return true;
+    }
+
+    private static Field findDrawableField(Class<?> renderTaskCls) {
+        try {
+            // SafeRunnable declares final GifDrawable e
+            Class<?> c = renderTaskCls;
+            while (c != null && c != Object.class) {
+                try {
+                    Field f = c.getDeclaredField("e");
+                    f.setAccessible(true);
+                    return f;
+                } catch (NoSuchFieldException ignored) {
+                    c = c.getSuperclass();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     private void dumpMethods(Class<?> cls, String label) {
@@ -241,7 +329,6 @@ public class MainHook implements IXposedHookLoadPackage {
             }
             XLog.i(sb.toString());
         } catch (Throwable ignored) {
-            // Best-effort diagnostics only.
         }
     }
 
