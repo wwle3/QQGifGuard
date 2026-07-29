@@ -64,6 +64,13 @@ public class MainHook implements IXposedHookLoadPackage {
         UiVisibility.setInteractiveListener(() -> {
             // Returning to QQ: restart still-attached GIFs that we only stopped.
             GifDrawableTracker.resumeAttached("app-interactive");
+            // Second pass after first layout/visibility settles (QQ 9.1.60 leave/return).
+            final android.os.Handler h = new android.os.Handler(android.os.Looper.getMainLooper());
+            h.postDelayed(() -> {
+                if (UiVisibility.isInteractive()) {
+                    GifDrawableTracker.resumeAttached("app-interactive-deferred");
+                }
+            }, 400L);
         });
 
         hookApplicationCreate(lpparam.classLoader);

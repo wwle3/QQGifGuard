@@ -272,32 +272,35 @@ final class GifDrawableTracker {
     }
 
     /**
-     * After app becomes interactive again, restart stopped-but-still-owned GIFs
-     * that are visible enough to animate. Does not touch recycled orphans.
+     * After app becomes interactive again, restart stopped-but-still-owned GIFs.
+     * Conservative visibility checks are used to avoid missing just-returned chat
+     * items on QQ 9.1.60 where getGlobalVisibleRect can lag one frame.
      */
     static void resumeAttached(String reason) {
         prune();
         int started = 0;
         int seen = 0;
+        int eligible = 0;
         for (Entry e : sMap.values()) {
             Object d = e.ref.get();
             if (d == null || e.recycledByUs || isRecycled(d)) {
                 continue;
             }
             seen++;
-            // Only resume drawables still owned by an on-screen-ish view.
-            if (!isAttachedToUi(d) || !isCallbackViewLikelyVisible(d)) {
+            if (!isAttachedToUi(d) || !isCallbackViewResumeCandidate(d)) {
                 continue;
             }
+            eligible++;
             e.hiddenSinceMs = 0L;
             ensureDrawableVisible(d);
             if (startDrawable(d)) {
                 started++;
             }
         }
-        if (started > 0 || seen > 0) {
+        if (started > 0 || seen > 0 || eligible > 0) {
             XLog.i("resumeAttached reason=" + reason
                     + " started=" + started
+                    + " eligible=" + eligible
                     + " tracked=" + seen);
             GuardStats.maybeSummary(reason, 5_000L);
         }
@@ -463,6 +466,39 @@ final class GifDrawableTracker {
         }
     }
 
+    /**
+     * Looser than isCallbackViewLikelyVisible for leave/return resume.
+     * QQ may restore activity before children report a non-empty global rect.
+     */
+    private static boolean isCallbackViewResumeCandidate(Object drawable) {
+        Object cb = getCallback(drawable);
+        if (cb == null) {
+            return false;
+        }
+        if (!(cb instanceof android.view.View)) {
+            return true;
+        }
+        android.view.View v = (android.view.View) cb;
+        try {
+            if (!v.isAttachedToWindow()) {
+                return false;
+            }
+            // VISIBLE/INVISIBLE both allowed; GONE is not a resume candidate.
+            if (v.getVisibility() == android.view.View.GONE) {
+                return false;
+            }
+            // If the view has been laid out with non-zero size, try resume even if
+            // global-visible-rect is temporarily empty during the first frames.
+            if (v.getWidth() > 0 && v.getHeight() > 0) {
+                return true;
+            }
+            android.graphics.Rect r = new android.graphics.Rect();
+            return v.getGlobalVisibleRect(r);
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
     private static void ensureDrawableVisible(Object drawable) {
         try {
             Object visibleObj = XposedHelpers.callMethod(drawable, "isVisible");
@@ -522,10 +558,19 @@ final class GifDrawableTracker {
                 }
             } catch (Throwable ignored) {
             }
-            if (!running) {
-                XposedHelpers.callMethod(d, "start");
-                return true;
+            if (running) {
+                return false;
             }
+            XposedHelpers.callMethod(d, "start");
+            // Verify when possible; some builds no-op start on bad internal state.
+            try {
+                Object r = XposedHelpers.callMethod(d, "isRunning");
+                if (r instanceof Boolean) {
+                    return (Boolean) r;
+                }
+            } catch (Throwable ignored) {
+            }
+            return true;
         } catch (Throwable t) {
             XLog.w("startDrawable failed: " + t.getMessage());
         }
