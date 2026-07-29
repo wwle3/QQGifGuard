@@ -15,6 +15,7 @@ import de.robv.android.xposed.XposedHelpers;
  * - recycle only true orphans (no UI callback / detached) after timeout
  * - still-attached drawables are stopped but kept so returning to chat can resume
  * - if it becomes visible again before timeout, cancel recycle and allow restart
+ * - handle/isRecycled checks are version-aware (9.1.25 and 9.1.60 field layouts)
  */
 final class GifDrawableTracker {
     private static final class Entry {
@@ -265,14 +266,7 @@ final class GifDrawableTracker {
         if (wasRecycledByUs(drawable)) {
             return true;
         }
-        try {
-            // GifDrawable.l() => handle already freed
-            Object r = XposedHelpers.callMethod(drawable, "l");
-            if (r instanceof Boolean && (Boolean) r) {
-                return true;
-            }
-        } catch (Throwable ignored) {
-        }
+        // Prefer explicit API when present.
         try {
             Object r = XposedHelpers.callMethod(drawable, "isRecycled");
             if (r instanceof Boolean && (Boolean) r) {
@@ -280,7 +274,95 @@ final class GifDrawableTracker {
             }
         } catch (Throwable ignored) {
         }
+        // QQ 9.1.25: l() may mean "handle freed" as boolean.
+        // QQ 9.1.60: l() is an int helper and must NOT be treated as recycled flag.
+        try {
+            Object r = XposedHelpers.callMethod(drawable, "l");
+            if (r instanceof Boolean && (Boolean) r) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        // If native handle object is already gone, treat as recycled.
+        Object handle = findGifInfoHandle(drawable);
+        if (handle == null) {
+            // Only conclude recycled when we positively know the field map and handle is null.
+            // If field discovery failed entirely, fail open (not recycled).
+            if (sHandleFieldResolved) {
+                return true;
+            }
+        } else {
+            try {
+                // GifInfoHandle native pointer field is commonly "a" (long). 0 => freed.
+                Object nativePtr = XposedHelpers.getObjectField(handle, "a");
+                if (nativePtr instanceof Long && ((Long) nativePtr) == 0L) {
+                    return true;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
         return false;
+    }
+
+    /** True after we successfully identified a handle field name on this process. */
+    private static volatile boolean sHandleFieldResolved = false;
+    private static volatile String sHandleFieldName = null;
+
+    /**
+     * Resolve GifInfoHandle from GifDrawable across QQ versions.
+     * 9.1.25-era builds often used field "n"; 9.1.60 uses field "o"
+     * while "n" is the Bitmap. Never assume a fixed field blindly.
+     */
+    private static Object findGifInfoHandle(Object drawable) {
+        if (drawable == null) {
+            return null;
+        }
+        String cached = sHandleFieldName;
+        if (cached != null) {
+            try {
+                return XposedHelpers.getObjectField(drawable, cached);
+            } catch (Throwable ignored) {
+                // Fall through and rediscover.
+            }
+        }
+        // Discover by concrete type name to avoid grabbing Bitmap/Paint/etc.
+        String[] candidates = new String[] {"o", "n", "m", "h", "g", "f", "e"};
+        for (String name : candidates) {
+            try {
+                Object v = XposedHelpers.getObjectField(drawable, name);
+                if (v == null) {
+                    continue;
+                }
+                String cn = v.getClass().getName();
+                if ("com.tencent.libra.extension.gif.GifInfoHandle".equals(cn)
+                        || cn.endsWith(".GifInfoHandle")) {
+                    sHandleFieldName = name;
+                    sHandleFieldResolved = true;
+                    return v;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        // As a weaker signal: any field whose class simple name is GifInfoHandle.
+        try {
+            for (java.lang.reflect.Field f : drawable.getClass().getDeclaredFields()) {
+                try {
+                    f.setAccessible(true);
+                    Object v = f.get(drawable);
+                    if (v == null) {
+                        continue;
+                    }
+                    if (v.getClass().getName().endsWith(".GifInfoHandle")) {
+                        sHandleFieldName = f.getName();
+                        sHandleFieldResolved = true;
+                        return v;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     /**
@@ -417,12 +499,23 @@ final class GifDrawableTracker {
             return true;
         } catch (Throwable t) {
             XLog.w("recycleDrawable failed: " + t.getMessage());
-            // Fallback: try native free via handle field "n" -> w()
+            // Fallback: free native handle via version-aware field discovery.
+            // 9.1.60: handle is field "o"; "n" is Bitmap and must not be used.
             try {
-                Object handle = XposedHelpers.getObjectField(d, "n");
+                Object handle = findGifInfoHandle(d);
                 if (handle != null) {
-                    XposedHelpers.callMethod(handle, "w");
-                    return true;
+                    try {
+                        XposedHelpers.callMethod(handle, "w");
+                        return true;
+                    } catch (Throwable ignored) {
+                    }
+                    try {
+                        // Some builds expose free(long) / free native path.
+                        XposedHelpers.callMethod(handle, "free",
+                                XposedHelpers.getLongField(handle, "a"));
+                        return true;
+                    } catch (Throwable ignored) {
+                    }
                 }
             } catch (Throwable t2) {
                 XLog.w("free-handle fallback failed: " + t2.getMessage());
