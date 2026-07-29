@@ -118,7 +118,7 @@ Expected:
 - Periodic `stats reason=...` lines show tracked / stopped / recycled / blocked counters
 - After idle or UID unfreeze, no sustained `pool-*` / `libgiflibra` CPU spin
 
-See `docs/verification.md` for the full 0.2.1 regression checklist and observation commands.
+See `docs/verification.md` for the full 0.2.2 regression checklist and observation commands.
 
 ## Version lock
 
