@@ -15,13 +15,13 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * LSPosed entry for QQ GIF Guard.
  *
- * Target: QQ 9.1.25 (8368), package com.tencent.mobileqq.
+ * Target: QQ 9.1.25 / 9.1.60 Libra GIF path, package com.tencent.mobileqq.
  *
  * Strategy:
  * L1  - stop/block animation when not needed
  * L1.5- sweep orphan running drawables
- * L2  - delayed recycle() only for detached orphan drawables
- *       (attached-but-stopped GIFs are kept so returning to chat can resume)
+ * L2  - conservative delayed recycle() only for stable detached orphans
+ *       (no foreground recycle sweep; avoid black images until rebind)
  */
 public class MainHook implements IXposedHookLoadPackage {
     private static final String PKG = "com.tencent.mobileqq";
@@ -33,10 +33,13 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final AtomicBoolean sSweepStarted = new AtomicBoolean(false);
 
     private static final long ORPHAN_SWEEP_INTERVAL_MS = 2000L;
-    /** Detached orphan long enough => recycle (L2). Attached ones are never recycled. */
-    private static final long RECYCLE_AFTER_HIDDEN_MS = 8000L;
-    /** When app itself is non-interactive, recycle detached orphans a bit sooner. */
-    private static final long RECYCLE_AFTER_BG_MS = 5000L;
+    /**
+     * Foreground L2 is disabled (0 => skip). Black-image reports show current-screen
+     * items can look "detached" briefly during QQ rebind; stop-only is safer.
+     */
+    private static final long RECYCLE_AFTER_HIDDEN_MS = 0L;
+    /** Background only: stable orphans may be recycled after a longer grace period. */
+    private static final long RECYCLE_AFTER_BG_MS = 20000L;
 
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) {
@@ -53,9 +56,9 @@ public class MainHook implements IXposedHookLoadPackage {
 
         UiVisibility.install(lpparam.classLoader);
         UiVisibility.setNonInteractiveListener(() -> {
+            // Immediate CPU protection only. Do not recycle on the transition edge:
+            // QQ 9.1.60 may transiently detach callbacks while leaving chat.
             GifDrawableTracker.stopAll("app-non-interactive");
-            // Soft L2 on background: recycle detached orphans only.
-            GifDrawableTracker.recycleStale("app-non-interactive", RECYCLE_AFTER_BG_MS);
             GuardStats.forceSummary("app-non-interactive");
         });
         UiVisibility.setInteractiveListener(() -> {
@@ -69,7 +72,7 @@ public class MainHook implements IXposedHookLoadPackage {
         hookRenderTask(lpparam.classLoader);
         startMaintenanceSweeper();
 
-        XLog.i("hooks installed (L1+L2 detached-only recycle)");
+        XLog.i("hooks installed (L1+L2 conservative orphan recycle)");
     }
 
     private void startMaintenanceSweeper() {
@@ -83,10 +86,15 @@ public class MainHook implements IXposedHookLoadPackage {
                 try {
                     if (!UiVisibility.isInteractive()) {
                         GifDrawableTracker.stopAll("sweep-non-interactive");
-                        GifDrawableTracker.recycleStale("sweep-bg-recycle", RECYCLE_AFTER_BG_MS);
+                        if (RECYCLE_AFTER_BG_MS > 0L) {
+                            GifDrawableTracker.recycleStale("sweep-bg-recycle", RECYCLE_AFTER_BG_MS);
+                        }
                     } else {
                         GifDrawableTracker.stopOrphans("sweep-orphans");
-                        GifDrawableTracker.recycleStale("sweep-stale-recycle", RECYCLE_AFTER_HIDDEN_MS);
+                        // Foreground recycle intentionally off by default.
+                        if (RECYCLE_AFTER_HIDDEN_MS > 0L) {
+                            GifDrawableTracker.recycleStale("sweep-stale-recycle", RECYCLE_AFTER_HIDDEN_MS);
+                        }
                     }
                     // Heartbeat summary so idle regressions are visible within ~30s.
                     GuardStats.maybeSummary("maintenance", 30_000L);

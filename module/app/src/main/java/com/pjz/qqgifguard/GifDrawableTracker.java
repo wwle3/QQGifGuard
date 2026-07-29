@@ -175,15 +175,19 @@ final class GifDrawableTracker {
     }
 
     /**
-     * Recycle only orphan drawables that stayed detached longer than timeoutMs.
-     * Still-attached-but-hidden GIFs are intentionally NOT recycled: destroying
-     * them leaves blank ImageViews until QQ rebinds (re-enter chat / scroll).
+     * Recycle only stable orphans that stayed detached longer than timeoutMs.
+     *
+     * Conservative policy (black-image fix):
+     * - never recycle while a UI callback still owns the drawable
+     * - require callback == null AND not running for the whole timeout window
+     * - still-attached/hidden GIFs are stop-only so leave/return can resume
      */
     static void recycleStale(String reason, long timeoutMs) {
         prune();
         int recycled = 0;
         int candidates = 0;
         int attachedSkipped = 0;
+        int unstableSkipped = 0;
         long now = System.currentTimeMillis();
         for (Entry e : sMap.values()) {
             Object d = e.ref.get();
@@ -202,6 +206,13 @@ final class GifDrawableTracker {
                 }
                 continue;
             }
+            // Detached alone is not enough on QQ 9.1.60: require stable orphan predicates.
+            if (!isStableOrphanForRecycle(d)) {
+                unstableSkipped++;
+                // Keep waiting; do not start/advance aggressive recycle timer on unstable state.
+                e.hiddenSinceMs = 0L;
+                continue;
+            }
             if (e.hiddenSinceMs == 0L) {
                 e.hiddenSinceMs = now;
                 continue;
@@ -216,15 +227,48 @@ final class GifDrawableTracker {
             }
         }
         GuardStats.onRecycled(recycled);
-        if (recycled > 0 || candidates > 0 || attachedSkipped > 0) {
+        if (recycled > 0 || candidates > 0 || attachedSkipped > 0 || unstableSkipped > 0) {
             XLog.i("recycleStale reason=" + reason
                     + " recycled=" + recycled
                     + " candidates=" + candidates
                     + " attachedSkipped=" + attachedSkipped
+                    + " unstableSkipped=" + unstableSkipped
                     + " timeoutMs=" + timeoutMs
                     + " tracked=" + sMap.size());
             GuardStats.maybeSummary(reason, 5_000L);
         }
+    }
+
+    /**
+     * Strict orphan gate before L2 destruction.
+     * Aimed at "black until scroll/re-enter" where QQ briefly nulls callback
+     * but will rebind the same chat item soon after.
+     */
+    private static boolean isStableOrphanForRecycle(Object drawable) {
+        if (drawable == null || isRecycled(drawable)) {
+            return false;
+        }
+        // Must have no UI owner.
+        if (getCallback(drawable) != null) {
+            return false;
+        }
+        // Must not be animating.
+        try {
+            Object r = XposedHelpers.callMethod(drawable, "isRunning");
+            if (r instanceof Boolean && (Boolean) r) {
+                return false;
+            }
+        } catch (Throwable ignored) {
+        }
+        // Prefer invisible; if isVisible fails open, callback/running checks still protect us.
+        try {
+            Object v = XposedHelpers.callMethod(drawable, "isVisible");
+            if (v instanceof Boolean && (Boolean) v) {
+                return false;
+            }
+        } catch (Throwable ignored) {
+        }
+        return true;
     }
 
     /**
